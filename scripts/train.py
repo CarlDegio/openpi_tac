@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
 
@@ -55,19 +56,84 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+    wandb_id_path = ckpt_dir / "wandb_id.txt"
+    if resuming and wandb_id_path.exists():
+        run_id = wandb_id_path.read_text().strip()
+        wandb.init(id=run_id, resume="allow", project=config.project_name)
     else:
+        if resuming:
+            logging.warning("Resuming checkpoint without wandb_id.txt; starting a new W&B run.")
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
         )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        wandb_id_path.write_text(wandb.run.id)
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def init_tensorboard(config: _config.TrainConfig):
+    enabled = os.environ.get("OPENPI_ENABLE_TENSORBOARD", "0").lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return None
+
+    log_dir = os.environ.get("OPENPI_TENSORBOARD_LOGDIR") or str(config.checkpoint_dir / "tensorboard")
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except Exception as exc:  # pragma: no cover - depends on optional runtime package.
+        logging.warning("TensorBoard logging disabled because SummaryWriter is unavailable: %s", exc)
+        return None
+
+    writer = SummaryWriter(log_dir=log_dir)
+    logging.info("TensorBoard logging to %s", log_dir)
+    return writer
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning("Invalid integer for %s=%r; using %d", name, value, default)
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_checkpoint_steps(name: str, num_train_steps: int) -> set[int]:
+    value = os.environ.get(name)
+    if not value:
+        return set()
+    steps = set()
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if part.endswith("%"):
+            step = round(num_train_steps * float(part[:-1]) / 100.0)
+        else:
+            number = float(part)
+            step = round(num_train_steps * number) if 0 < number <= 1 else round(number)
+        steps.add(min(max(int(step), 1), num_train_steps))
+    return steps
+
+
+def _evenly_spaced_steps(start_step: int, end_step: int, count: int) -> set[int]:
+    if count <= 0 or end_step <= start_step:
+        return set()
+    total_steps = end_step - start_step
+    if count >= total_steps:
+        return set(range(start_step, end_step))
+    return set(int(step) for step in np.linspace(start_step, end_step - 1, num=count))
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -191,6 +257,23 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def action_mse_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+    *,
+    num_steps: int,
+) -> dict[str, at.Array]:
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, actions = batch
+    pred_actions = model.sample_actions(rng, observation, num_steps=num_steps)
+    action_mse = jnp.mean(jnp.square(pred_actions - actions))
+    return {"eval/action_mse": action_mse, "eval/action_rmse": jnp.sqrt(action_mse)}
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -216,6 +299,7 @@ def main(config: _config.TrainConfig):
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    tensorboard_writer = init_tensorboard(config)
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -227,11 +311,15 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+    camera_view_images = [
+        np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1)
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
+    images_to_log = [wandb.Image(image) for image in camera_view_images]
     wandb.log({"camera_views": images_to_log}, step=0)
+    if tensorboard_writer is not None:
+        for i, image in enumerate(camera_view_images):
+            tensorboard_writer.add_image(f"camera_views/sample_{i}", image, 0, dataformats="HWC")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -248,6 +336,26 @@ def main(config: _config.TrainConfig):
     )
 
     start_step = int(train_state.step)
+    action_mse_evals = _env_int("OPENPI_ACTION_MSE_EVALS", 10)
+    action_mse_num_steps = _env_int("OPENPI_ACTION_MSE_NUM_STEPS", 10)
+    wait_after_checkpoint = _env_bool("OPENPI_WAIT_AFTER_CHECKPOINT", True)
+    save_train_state = _env_bool("OPENPI_SAVE_TRAIN_STATE", True)
+    checkpoint_steps = _env_checkpoint_steps("OPENPI_CHECKPOINT_STEPS", config.num_train_steps)
+    if checkpoint_steps:
+        logging.info("Checkpoint steps enabled: %s", sorted(checkpoint_steps))
+        logging.info("Checkpoint save_train_state: %s", save_train_state)
+    action_mse_steps = _evenly_spaced_steps(start_step, config.num_train_steps, action_mse_evals)
+    if action_mse_steps:
+        logging.info(
+            "Action MSE eval enabled: %d evals, sample_actions num_steps=%d",
+            len(action_mse_steps),
+            action_mse_num_steps,
+        )
+    paction_mse_step = jax.jit(
+        functools.partial(action_mse_step, config, num_steps=action_mse_num_steps),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -266,14 +374,49 @@ def main(config: _config.TrainConfig):
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
+            if tensorboard_writer is not None:
+                for key, value in reduced_info.items():
+                    tensorboard_writer.add_scalar(key, float(value), step)
+                tensorboard_writer.flush()
             infos = []
+        if step in action_mse_steps:
+            action_mse_rng = jax.random.fold_in(train_rng, step + 1_000_000)
+            with sharding.set_mesh(mesh):
+                action_mse_info = paction_mse_step(action_mse_rng, train_state, batch)
+            action_mse_info = jax.device_get(action_mse_info)
+            action_mse_str = ", ".join(f"{k}={v:.6f}" for k, v in action_mse_info.items())
+            pbar.write(f"Step {step}: {action_mse_str}")
+            wandb.log(action_mse_info, step=step)
+            if tensorboard_writer is not None:
+                for key, value in action_mse_info.items():
+                    tensorboard_writer.add_scalar(key, float(value), step)
+                tensorboard_writer.flush()
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+        completed_step = step + 1
+        should_save_by_interval = (
+            not checkpoint_steps
+            and config.save_interval > 0
+            and completed_step % config.save_interval == 0
+            and completed_step > start_step
+        )
+        should_save_by_step = completed_step in checkpoint_steps and completed_step > start_step
+        if should_save_by_interval or should_save_by_step or completed_step == config.num_train_steps:
+            _checkpoints.save_state(
+                checkpoint_manager,
+                train_state,
+                data_loader,
+                completed_step,
+                save_train_state=save_train_state,
+            )
+            if wait_after_checkpoint:
+                logging.info("Waiting for checkpoint save to finish before continuing training.")
+                checkpoint_manager.wait_until_finished()
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    if tensorboard_writer is not None:
+        tensorboard_writer.close()
 
 
 if __name__ == "__main__":

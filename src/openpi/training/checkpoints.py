@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+import os
 from typing import Protocol
 
 from etils import epath
@@ -15,6 +16,27 @@ from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+
+
+_AUXILIARY_DIRS = frozenset({"tensorboard", "wandb"})
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logging.warning("Invalid integer for %s=%r; using %d", name, value, default)
+        return default
 
 
 def initialize_checkpoint_dir(
@@ -29,6 +51,8 @@ def initialize_checkpoint_dir(
             logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
         elif resume:
             resuming = True
+        elif _contains_only_auxiliary_files(checkpoint_dir):
+            logging.info("Checkpoint directory %s contains only auxiliary logs; starting fresh.", checkpoint_dir)
         else:
             raise FileExistsError(
                 f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
@@ -36,6 +60,10 @@ def initialize_checkpoint_dir(
             )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    async_checkpointing = _env_bool("OPENPI_ASYNC_CHECKPOINT", True)
+    max_to_keep = _env_int("OPENPI_MAX_CHECKPOINTS", 1)
+    logging.info("Orbax async checkpointing enabled: %s", async_checkpointing)
+    logging.info("Orbax max checkpoints to keep: %d", max_to_keep)
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
@@ -45,9 +73,10 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
+            max_to_keep=max_to_keep,
             keep_period=keep_period,
             create=False,
+            enable_async_checkpointing=async_checkpointing,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )
@@ -62,11 +91,18 @@ def initialize_checkpoint_dir(
     return mngr, resuming
 
 
+def _contains_only_auxiliary_files(checkpoint_dir: epath.Path) -> bool:
+    children = list(checkpoint_dir.iterdir())
+    return bool(children) and all(child.name in _AUXILIARY_DIRS for child in children)
+
+
 def save_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    save_train_state: bool = True,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -80,9 +116,10 @@ def save_state(
         train_state, params = _split_params(state)
     items = {
         "assets": save_assets,
-        "train_state": train_state,
         "params": {"params": params},
     }
+    if save_train_state:
+        items["train_state"] = train_state
     checkpoint_manager.save(step, items)
 
 

@@ -1,7 +1,12 @@
 from collections.abc import Iterator, Sequence
+import bisect
+import dataclasses
+import io
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -9,6 +14,8 @@ import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
+import pyarrow.parquet as pq
+from PIL import Image
 import torch
 
 import openpi.models.model as _model
@@ -60,6 +67,21 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class ConcatDataset(Dataset[T_co]):
+    def __init__(self, datasets: Sequence[Dataset]):
+        self._datasets = datasets
+        self._cumulative_sizes = np.cumsum([len(dataset) for dataset in datasets]).tolist()
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        idx = index.__index__()
+        dataset_idx = bisect.bisect_right(self._cumulative_sizes, idx)
+        previous_size = 0 if dataset_idx == 0 else self._cumulative_sizes[dataset_idx - 1]
+        return self._datasets[dataset_idx][idx - previous_size]
+
+    def __len__(self) -> int:
+        return self._cumulative_sizes[-1]
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -127,6 +149,99 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class LocalLeRobotParquetDataset(Dataset):
+    """Minimal local LeRobot parquet reader for datasets with incompatible HF parquet metadata."""
+
+    def __init__(
+        self,
+        root: str,
+        delta_timestamps: dict[str, list[float]],
+        columns: set[str] | None = None,
+        *,
+        load_all_image_columns: bool = False,
+    ):
+        self._root = pathlib.Path(root)
+        with (self._root / "meta" / "info.json").open() as f:
+            self._info = json.load(f)
+        with (self._root / "meta" / "episodes.jsonl").open() as f:
+            self._episodes = [json.loads(line) for line in f]
+        with (self._root / "meta" / "tasks.jsonl").open() as f:
+            self._tasks = {int(item["task_index"]): item["task"] for item in map(json.loads, f)}
+
+        self._fps = self._info["fps"]
+        feature_keys = set(self._info["features"])
+        requested_columns = feature_keys if columns is None else set(columns)
+        if load_all_image_columns:
+            requested_columns.update(
+                key for key, feature in self._info["features"].items() if feature.get("dtype") == "image"
+            )
+        requested_columns.update(delta_timestamps)
+        requested_columns.add("task_index")
+        self._columns = requested_columns & feature_keys
+        self._image_keys = {
+            key
+            for key, feature in self._info["features"].items()
+            if key in self._columns and feature.get("dtype") == "image"
+        }
+        self._lengths = [int(ep["length"]) for ep in self._episodes]
+        self._starts = np.cumsum([0, *self._lengths[:-1]]).tolist()
+        self._ends = np.cumsum(self._lengths).tolist()
+        self._delta_indices = {
+            key: [int(round(timestamp * self._fps)) for timestamp in timestamps]
+            for key, timestamps in delta_timestamps.items()
+        }
+        self._episode_cache: dict[int, list[dict]] = {}
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        idx = index.__index__()
+        ep_pos = bisect.bisect_right(self._starts, idx) - 1
+        local_idx = idx - self._starts[ep_pos]
+        rows = self._load_episode(ep_pos)
+
+        item = self._convert_row(rows[local_idx])
+        for key, delta_indices in self._delta_indices.items():
+            values = []
+            padding = []
+            for delta in delta_indices:
+                query_idx = local_idx + delta
+                padding.append(query_idx < 0 or query_idx >= len(rows))
+                query_idx = min(max(query_idx, 0), len(rows) - 1)
+                values.append(self._convert_value(key, rows[query_idx][key]))
+            item[key] = np.asarray(values, dtype=np.float32)
+            item[f"{key}_is_pad"] = np.asarray(padding, dtype=np.bool_)
+
+        item["task"] = self._tasks[int(item["task_index"])]
+        return item
+
+    def __len__(self) -> int:
+        return self._ends[-1]
+
+    def _load_episode(self, ep_pos: int) -> list[dict]:
+        if ep_pos not in self._episode_cache:
+            ep_idx = int(self._episodes[ep_pos]["episode_index"])
+            episode_chunk = ep_idx // int(self._info["chunks_size"])
+            path = self._root / self._info["data_path"].format(
+                episode_chunk=episode_chunk,
+                episode_index=ep_idx,
+            )
+            if len(self._episode_cache) >= 4:
+                self._episode_cache.pop(next(iter(self._episode_cache)))
+            self._episode_cache[ep_pos] = pq.read_table(path, columns=sorted(self._columns)).to_pylist()
+        return self._episode_cache[ep_pos]
+
+    def _convert_row(self, row: dict) -> dict:
+        return {key: self._convert_value(key, value) for key, value in row.items()}
+
+    def _convert_value(self, key: str, value):
+        if key in self._image_keys and isinstance(value, dict) and value.get("bytes") is not None:
+            return np.asarray(Image.open(io.BytesIO(value["bytes"])))
+        if isinstance(value, list):
+            feature = self._info["features"].get(key)
+            if feature is not None and feature.get("dtype") == "float32":
+                return np.asarray(value, dtype=np.float32)
+        return value
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,18 +252,71 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    repo_ids = data_config.repo_ids or (repo_id,)
+    if len(repo_ids) > 1:
+        return ConcatDataset([_create_single_torch_dataset(data_config, repo, action_horizon) for repo in repo_ids])
+
+    return _create_single_torch_dataset(data_config, repo_id, action_horizon)
+
+
+def _create_single_torch_dataset(data_config: _config.DataConfig, repo_id: str, action_horizon: int) -> Dataset:
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+    source_columns = _data_config_source_columns(data_config)
+    if pathlib.Path(repo_id).is_dir() and source_columns is not None:
+        logging.info(
+            "Using local parquet reader for %s with columns: %s",
+            repo_id,
+            "all image columns + required columns"
+            if data_config.load_all_image_columns
+            else sorted(source_columns | set(delta_timestamps) | {"task_index"}),
+        )
+        dataset = LocalLeRobotParquetDataset(
+            repo_id,
+            delta_timestamps,
+            source_columns,
+            load_all_image_columns=data_config.load_all_image_columns,
+        )
+    else:
+        try:
+            dataset = lerobot_dataset.LeRobotDataset(
+                repo_id,
+                delta_timestamps=delta_timestamps,
+            )
+        except ValueError as err:
+            if not pathlib.Path(repo_id).is_dir():
+                raise
+            logging.warning("Falling back to local parquet reader for %s after LeRobotDataset error: %s", repo_id, err)
+            dataset = LocalLeRobotParquetDataset(
+                repo_id,
+                delta_timestamps,
+                source_columns,
+                load_all_image_columns=data_config.load_all_image_columns,
+            )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
+
+
+def _data_config_source_columns(data_config: _config.DataConfig) -> set[str] | None:
+    """Infer the source parquet columns needed before the first repack transform."""
+    columns: set[str] = set()
+    for transform in data_config.repack_transforms.inputs:
+        if not isinstance(transform, _transforms.RepackTransform):
+            return None
+
+        def add_source(value):
+            if isinstance(value, str):
+                columns.add(value)
+
+        jax.tree.map(add_source, transform.structure)
+    if data_config.prompt_from_task:
+        columns.add("task_index")
+    return columns or None
 
 
 def create_rlds_dataset(
@@ -240,6 +408,8 @@ def create_data_loader(
         framework: The framework to use ("jax" or "pytorch").
     """
     data_config = config.data.create(config.assets_dirs, config.model)
+    if config.tac in ("true", "onlyload"):
+        data_config = dataclasses.replace(data_config, load_all_image_columns=True)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:

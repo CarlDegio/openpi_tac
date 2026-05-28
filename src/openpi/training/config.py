@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.tac_policy as tac_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -32,6 +33,23 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+
+TacDatasetSubset: TypeAlias = Literal["all", "clean", "smash"]
+TacMode: TypeAlias = Literal["false", "true", "onlyload"]
+
+
+def _discover_local_lerobot_repos(root: str, subset: TacDatasetSubset = "all") -> tuple[str, ...]:
+    root_path = pathlib.Path(root).expanduser()
+    if not root_path.exists():
+        return ()
+    if subset == "all":
+        return tuple(str(path) for path in sorted(root_path.iterdir()) if (path / "meta" / "info.json").is_file())
+    return tuple(
+        str(path)
+        for path in sorted(root_path.iterdir())
+        if (path / "meta" / "info.json").is_file() and f"_{subset}_" in path.name
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +83,8 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional list of LeRobot repo ids/paths to concatenate for training.
+    repo_ids: Sequence[str] = ()
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -89,6 +109,9 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # If true, local parquet readers will load every image column, even if transforms only consume a subset.
+    # This is useful for profiling future multi-camera TAC training I/O.
+    load_all_image_columns: bool = False
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -463,6 +486,58 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotTacDataConfig(DataConfigFactory):
+    """Data config for Mani ViTac / TAC LeRobot datasets."""
+
+    repo_ids: Sequence[str] = ()
+    subset: TacDatasetSubset = "all"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        include_tactile = bool(getattr(model_config, "tactile_conditioning", False))
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.images.camera0": "observation.images.camera0",
+                        "observation.images.camera1": "observation.images.camera1",
+                        **(
+                            {
+                                "observation.images.tactile_left_0": "observation.images.tactile_left_0",
+                                "observation.images.tactile_left_1": "observation.images.tactile_left_1",
+                                "observation.images.tactile_right_0": "observation.images.tactile_right_0",
+                                "observation.images.tactile_right_1": "observation.images.tactile_right_1",
+                            }
+                            if include_tactile
+                            else {}
+                        ),
+                        "observation.state": "observation.state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[tac_policy.TacInputs(model_type=model_config.model_type, include_tactile=include_tactile)],
+            outputs=[tac_policy.TacOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            repo_ids=tuple(
+                repo_id
+                for repo_id in self.repo_ids
+                if self.subset == "all" or f"_{self.subset}_" in pathlib.Path(repo_id).name
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -507,6 +582,11 @@ class TrainConfig:
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
+    # TAC mode:
+    # - "false": baseline two-camera TAC training.
+    # - "onlyload": load tactile image parquet columns, but do not feed them to the model.
+    # - "true": load tactile images and condition the pi05 action expert on a ResNet18-style tactile feature.
+    tac: TacMode = "false"
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -554,6 +634,57 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.tac == "true":
+            if not isinstance(self.model, pi0_config.Pi0Config):
+                raise ValueError("--tac true is currently supported only for Pi0Config/pi05 models.")
+            object.__setattr__(self, "model", dataclasses.replace(self.model, tactile_conditioning=True))
+
+
+def _local_tac_repo_ids(subset: TacDatasetSubset = "all") -> tuple[str, ...]:
+    return _discover_local_lerobot_repos("/home/ubuntu/tac_data", subset=subset)
+
+
+def _local_tac_primary_repo(subset: TacDatasetSubset = "all") -> str:
+    repo_ids = _local_tac_repo_ids(subset)
+    if repo_ids:
+        return repo_ids[0]
+    return "/home/ubuntu/tac_data/blue_clean_01"
+
+
+def _local_tac_asset_id(subset: TacDatasetSubset = "all") -> str:
+    return "tac_all_pi05" if subset == "all" else f"tac_{subset}_pi05"
+
+
+def _pi05_tac_train_config(name: str, subset: TacDatasetSubset = "all") -> TrainConfig:
+    return TrainConfig(
+        name=name,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotTacDataConfig(
+            repo_id=_local_tac_primary_repo(subset),
+            repo_ids=_local_tac_repo_ids(subset),
+            subset=subset,
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="/home/ubuntu/tac_data/openpi_assets",
+                asset_id=_local_tac_asset_id(subset),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=20_000,
+        batch_size=48,
+    )
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -916,6 +1047,36 @@ _CONFIGS = [
         num_train_steps=20_000,
         batch_size=32,
     ),
+    TrainConfig(
+        name="pi05_tac_blue_clean_01",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotTacDataConfig(
+            repo_id="/home/ubuntu/tac_data/blue_clean_01",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="/home/ubuntu/tac_data/openpi_assets",
+                asset_id="blue_clean_01_pi05",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=20_000,
+        batch_size=48,
+    ),
+    _pi05_tac_train_config("pi05_tac_all", "all"),
+    _pi05_tac_train_config("pi05_tac_clean", "clean"),
+    _pi05_tac_train_config("pi05_tac_smash", "smash"),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #

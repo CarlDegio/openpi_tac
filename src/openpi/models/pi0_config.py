@@ -31,6 +31,9 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # If true, TAC tactile cameras are encoded with a ResNet18-style encoder and added to the pi05 action expert
+    # conditioning vector.
+    tactile_conditioning: bool = False
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -66,17 +69,22 @@ class Pi0Config(_model.BaseModelConfig):
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
+            images = {
+                "base_0_rgb": image_spec,
+                "left_wrist_0_rgb": image_spec,
+                "right_wrist_0_rgb": image_spec,
+            }
+            image_masks = {
+                "base_0_rgb": image_mask_spec,
+                "left_wrist_0_rgb": image_mask_spec,
+                "right_wrist_0_rgb": image_mask_spec,
+            }
+            if self.tactile_conditioning:
+                images.update({key: image_spec for key in _model.TACTILE_IMAGE_KEYS})
+                image_masks.update({key: image_mask_spec for key in _model.TACTILE_IMAGE_KEYS})
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images=images,
+                image_masks=image_masks,
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),

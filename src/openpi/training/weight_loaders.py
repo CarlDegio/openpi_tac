@@ -50,8 +50,8 @@ class CheckpointWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add locally initialized weights that are intentionally absent from base checkpoints.
+        return _merge_params(loaded_params, params, missing_regex=".*(lora|tactile).*")
 
 
 @dataclasses.dataclass(frozen=True)

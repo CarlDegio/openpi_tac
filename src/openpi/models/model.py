@@ -42,6 +42,13 @@ IMAGE_KEYS = (
     "right_wrist_0_rgb",
 )
 
+TACTILE_IMAGE_KEYS = (
+    "tactile_left_0_rgb",
+    "tactile_left_1_rgb",
+    "tactile_right_0_rgb",
+    "tactile_right_1_rgb",
+)
+
 
 # This may need change if we release a small model.
 IMAGE_RESOLUTION = (224, 224)
