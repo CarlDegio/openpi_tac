@@ -75,53 +75,6 @@ DEFAULT_OBS_KEYS = {
 }
 
 
-@dataclass(frozen=True)
-class GripperCloseBoost:
-    """Post-processes gripper commands that are already near the closed range."""
-
-    amount: float = 0.0
-    threshold: float = 0.075
-    minimum: float = 0.0
-
-    @property
-    def enabled(self) -> bool:
-        return self.amount > 0.0
-
-    def apply(self, actions: np.ndarray, *, arm_num: int) -> tuple[np.ndarray, dict[str, Any]]:
-        if not self.enabled:
-            return actions, {"enabled": False, "modified": 0}
-
-        adjusted = np.array(actions, copy=True)
-        gripper_indices = [9] if arm_num == 1 else [9, 19]
-        stats: dict[str, Any] = {
-            "enabled": True,
-            "modified": 0,
-            "threshold": self.threshold,
-            "amount": self.amount,
-            "minimum": self.minimum,
-        }
-
-        for index in gripper_indices:
-            values = adjusted[:, index]
-            close_mask = values <= self.threshold
-            if not np.any(close_mask):
-                continue
-
-            before = values[close_mask].copy()
-            values[close_mask] = np.maximum(before - self.amount, self.minimum)
-            after = values[close_mask]
-            stats[f"idx_{index}"] = {
-                "count": int(close_mask.sum()),
-                "before_min": float(before.min()),
-                "before_max": float(before.max()),
-                "after_min": float(after.min()),
-                "after_max": float(after.max()),
-            }
-            stats["modified"] += int(close_mask.sum())
-
-        return adjusted, stats
-
-
 class ObsSaver:
     """Asynchronously saves received obs_dict for interface verification."""
 
@@ -397,27 +350,6 @@ def validate_actions(actions: Any, *, arm_num: int) -> np.ndarray:
 @click.option("--camera0-key", default=DEFAULT_OBS_KEYS["camera0"], show_default=True, help="Raw obs key for camera0.")
 @click.option("--camera1-key", default=DEFAULT_OBS_KEYS["camera1"], show_default=True, help="Raw obs key for camera1.")
 @click.option("--state-key", default=DEFAULT_OBS_KEYS["state"], show_default=True, help="Raw obs key for 20D state.")
-@click.option(
-    "--gripper-close-boost",
-    default=0.0,
-    show_default=True,
-    type=float,
-    help="Subtract this from gripper commands that are already at or below --gripper-close-threshold.",
-)
-@click.option(
-    "--gripper-close-threshold",
-    default=0.075,
-    show_default=True,
-    type=float,
-    help="Treat gripper command values at or below this as closing/closed.",
-)
-@click.option(
-    "--gripper-min",
-    default=0.0,
-    show_default=True,
-    type=float,
-    help="Lower clamp for boosted gripper command values.",
-)
 @click.option("--dry-run", is_flag=True, help="Resolve config/checkpoint and exit before connecting.")
 def main(
     model_name: str,
@@ -442,9 +374,6 @@ def main(
     camera0_key: str,
     camera1_key: str,
     state_key: str,
-    gripper_close_boost: float,
-    gripper_close_threshold: float,
-    gripper_min: float,
     dry_run: bool,
 ) -> None:
     config_name, checkpoint_dir = resolve_checkpoint(
@@ -466,17 +395,6 @@ def main(
     print(f"[obs] camera0_key={camera0_key}")
     print(f"[obs] camera1_key={camera1_key}")
     print(f"[obs] state_key={state_key}")
-
-    gripper_boost = GripperCloseBoost(
-        amount=gripper_close_boost,
-        threshold=gripper_close_threshold,
-        minimum=gripper_min,
-    )
-    print(
-        "[gripper] close_boost="
-        f"{gripper_boost.amount}, threshold={gripper_boost.threshold}, min={gripper_boost.minimum}, "
-        f"enabled={gripper_boost.enabled}"
-    )
 
     if dry_run:
         return
@@ -526,10 +444,7 @@ def main(
 
         result = policy.infer(policy_obs)
         actions = validate_actions(result["actions"], arm_num=arm_num)
-        actions, boost_stats = gripper_boost.apply(actions, arm_num=arm_num)
         print(f"[warmup] action shape={actions.shape}, min={actions.min():.6f}, max={actions.max():.6f}")
-        if gripper_boost.enabled:
-            print("[warmup] gripper boost:", json.dumps(boost_stats, indent=2))
 
         print("################################## Ready! ##################################")
         input("press enter to start...")
@@ -558,7 +473,6 @@ def main(
                 result = policy.infer(policy_obs)
                 infer_elapsed = time.monotonic() - infer_start
                 actions = validate_actions(result["actions"], arm_num=arm_num)
-                actions, boost_stats = gripper_boost.apply(actions, arm_num=arm_num)
                 client.send_action(actions, obs_seq=obs_seq)
 
                 now = time.monotonic()
@@ -566,8 +480,7 @@ def main(
                     print(
                         f"[main] iter={iter_idx} obs_seq={obs_seq} "
                         f"infer_time_ms={infer_elapsed * 1000.0:.1f} "
-                        f"dropped_obs={dropped_obs_count} "
-                        f"gripper_boosted={boost_stats['modified']}"
+                        f"dropped_obs={dropped_obs_count}"
                     )
                     last_status_log_time = now
 

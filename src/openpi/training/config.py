@@ -661,7 +661,7 @@ def _pi05_tac_train_config(name: str, subset: TacDatasetSubset = "all") -> Train
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=16,
+            action_horizon=50,
         ),
         data=LeRobotTacDataConfig(
             repo_id=_local_tac_primary_repo(subset),
@@ -997,7 +997,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=16,
+            action_horizon=50,
         ),
         data=RLDSDroidDataConfig(
             repo_id="droid",
@@ -1031,7 +1031,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,  # pi05 is trained with 32-dim actions
-            action_horizon=16,
+            action_horizon=50,
         ),
         data=LeRobotDROIDDataConfig(
             # Replace with your custom DROID LeRobot dataset repo id.
@@ -1052,7 +1052,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=16,
+            action_horizon=50,
         ),
         data=LeRobotTacDataConfig(
             repo_id="/home/ubuntu/tac_data/blue_clean_01",
