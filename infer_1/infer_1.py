@@ -5,6 +5,10 @@
 #   pi05_tac_clean -> config pi05_tac_clean, default experiment tac_clean_pi05
 #   pi05_tac_smash -> config pi05_tac_smash, default experiment tac_smash_pi05
 #
+# Example commands:
+#   uv run python infer_1/infer_1.py --model pi05_tac_clean --ckpt-dir Models/pi05_tac_clean/pi05_tac_clean/10000
+#   uv run python infer_1/infer_1.py --model pi05_tac_smash --ckpt-dir Models/pi05_tac_smash/pi05_tac_smash/10000
+#
 # Input obs dictionary passed to policy.infer, without tactile observations:
 #   {
 #     "observation.images.camera0": RGB left wrist image, uint8/float, shape (H, W, 3) or (..., H, W, 3)
@@ -73,6 +77,23 @@ DEFAULT_OBS_KEYS = {
     "camera1": "observation.images.camera1",
     "state": "observation.state",
 }
+
+
+LEFT_GRIPPER_ACTION_INDEX = 9
+LEFT_GRIPPER_CLOSE_THRESHOLD = 0.075
+LEFT_GRIPPER_FORCED_CLOSE_VALUE = 0.063
+
+
+def force_left_gripper_close(actions: np.ndarray) -> tuple[np.ndarray, int]:
+    """Force a stronger left gripper close command when the policy is already closing."""
+    close_mask = actions[:, LEFT_GRIPPER_ACTION_INDEX] <= LEFT_GRIPPER_CLOSE_THRESHOLD
+    modified_count = int(np.count_nonzero(close_mask))
+    if modified_count == 0:
+        return actions, 0
+
+    actions = actions.copy()
+    actions[close_mask, LEFT_GRIPPER_ACTION_INDEX] = LEFT_GRIPPER_FORCED_CLOSE_VALUE
+    return actions, modified_count
 
 
 class ObsSaver:
@@ -444,6 +465,7 @@ def main(
 
         result = policy.infer(policy_obs)
         actions = validate_actions(result["actions"], arm_num=arm_num)
+        actions, _ = force_left_gripper_close(actions)
         print(f"[warmup] action shape={actions.shape}, min={actions.min():.6f}, max={actions.max():.6f}")
 
         print("################################## Ready! ##################################")
@@ -473,6 +495,7 @@ def main(
                 result = policy.infer(policy_obs)
                 infer_elapsed = time.monotonic() - infer_start
                 actions = validate_actions(result["actions"], arm_num=arm_num)
+                actions, _ = force_left_gripper_close(actions)
                 client.send_action(actions, obs_seq=obs_seq)
 
                 now = time.monotonic()
